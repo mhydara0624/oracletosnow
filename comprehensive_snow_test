@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+Comprehensive Snowflake Python Connector Feature Tests
+Tests all functionality needed for Oracle to Snowflake migration
+Updated Test 6 for Oracle WKT pre-conversion workflow
+"""
+
+import os
+import tempfile
+import pandas as pd
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
+from dotenv import load_dotenv
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+import json
+from datetime import datetime
+
+class SnowflakeFeatureTester:
+    def __init__(self):
+        load_dotenv()
+        self.conn = None
+        self.cursor = None
+        self.test_table = "PYTHON_CONNECTOR_TEST"
+        self.test_stage = "PYTHON_CONNECTOR_STAGE"
+        
+    def load_private_key(self):
+        """Load RSA private key"""
+        private_key_path = os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH')
+        passphrase = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')
+        
+        with open(private_key_path, 'rb') as key_file:
+            private_key = load_pem_private_key(
+                key_file.read(),
+                password=passphrase.encode() if passphrase else None,
+            )
+        
+        return private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+    
+    def connect(self):
+        """Establish connection"""
+        print("🔗 Connecting to Snowflake...")
+        
+        private_key = self.load_private_key()
+        
+        self.conn = snowflake.connector.connect(
+            user=os.getenv('SNOWFLAKE_USER'),
+            account=os.getenv('SNOWFLAKE_ACCOUNT'),
+            private_key=private_key,
+            warehouse=os.getenv('SNOWFLAKE_WAREHOUSE'),
+            database=os.getenv('SNOWFLAKE_DATABASE'),
+            schema=os.getenv('SNOWFLAKE_SCHEMA'),
+            role=os.getenv('SNOWFLAKE_ROLE')
+        )
+        
+        self.cursor = self.conn.cursor()
+        print("✅ Connected successfully!")
+        return True
+    
+    def test_1_basic_queries(self):
+        """Test 1: Basic SQL execution"""
+        print("\n🧪 Test 1: Basic Query Execution")
+        
+        try:
+            # Test simple queries
+            queries = [
+                "SELECT CURRENT_TIMESTAMP() AS current_time",
+                "SELECT CURRENT_USER() AS current_user", 
+                "SELECT CURRENT_WAREHOUSE() AS warehouse",
+                "SELECT CURRENT_DATABASE() AS database",
+                "SELECT CURRENT_SCHEMA() AS schema"
+            ]
+            
+            for query in queries:
+                self.cursor.execute(query)
+                result = self.cursor.fetchone()
+                print(f"   ✅ {query.split('AS')[1].strip()}: {result[0]}")
+            
+            print("✅ Test 1 PASSED: Basic queries working")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Test 1 FAILED: {e}")
+            return False
+    
+    def test_2_create_stage(self):
+        """Test 2: Create internal stage for file operations"""
+        print("\n🧪 Test 2: Creating Internal Stage")
+        
+        try:
+            # Drop stage if exists
+            self.cursor.execute(f"DROP STAGE IF EXISTS {self.test_stage}")
+            
+            # Create internal stage
+            create_stage_sql = f"""
+            CREATE OR REPLACE STAGE {self.test_stage}
+            COMMENT = 'Test stage for Python connector validation'
+            """
+            
+            self.cursor.execute(create_stage_sql)
+            print(f"   ✅ Created stage: {self.test_stage}")
+            
+            # List stages to confirm
+            self.cursor.execute("SHOW STAGES")
+            stages = self.cursor.fetchall()
+            stage_names = [stage[1] for stage in stages]
+            
+            if self.test_stage in stage_names:
+                print(f"   ✅ Stage {self.test_stage} confirmed in SHOW STAGES")
+                print("✅ Test 2 PASSED: Stage creation working")
+                return True
+            else:
+                print(f"   ❌ Stage {self.test_stage} not found in SHOW STAGES")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Test 2 FAILED: {e}")
+            return False
+    
+    def test_3_put_command(self):
+        """Test 3: PUT command for file upload"""
+        print("\n🧪 Test 3: Testing PUT Command")
+        
+        try:
+            # Create a test CSV file
+            test_data = {
+                'id': [1, 2, 3, 4, 5],
+                'name': ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve'],
+                'age': [25, 30, 35, 28, 32],
+                'city': ['New York', 'London', 'Tokyo', 'Paris', 'Sydney'],
+                'salary': [50000, 60000, 75000, 55000, 68000]
+            }
+            
+            df = pd.DataFrame(test_data)
+            
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp_file:
+                df.to_csv(tmp_file.name, index=False)
+                temp_file_path = tmp_file.name
+            
+            print(f"   📝 Created test file: {temp_file_path}")
+            
+            # Use PUT command to upload file
+            put_command = f"PUT file://{temp_file_path} @{self.test_stage}"
+            
+            self.cursor.execute(put_command)
+            put_result = self.cursor.fetchall()
+            
+            print(f"   📤 PUT command result: {put_result}")
+            
+            if put_result and put_result[0][6] == 'UPLOADED':
+                print("   ✅ File uploaded successfully")
+            else:
+                print(f"   ❌ File upload failed: {put_result}")
+                return False
+            
+            # List files in stage
+            self.cursor.execute(f"LIST @{self.test_stage}")
+            files = self.cursor.fetchall()
+            print(f"   📁 Files in stage: {len(files)} files found")
+            
+            # Clean up temp file
+            os.unlink(temp_file_path)
+            
+            print("✅ Test 3 PASSED: PUT command working")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Test 3 FAILED: {e}")
+            return False
+    
+    def test_4_copy_into(self):
+        """Test 4: COPY INTO command"""
+        print("\n🧪 Test 4: Testing COPY INTO Command")
+        
+        try:
+            # Create test table
+            create_table_sql = f"""
+            CREATE OR REPLACE TABLE {self.test_table} (
+                id INTEGER,
+                name STRING,
+                age INTEGER,
+                city STRING,
+                salary INTEGER
+            )
+            """
+            
+            self.cursor.execute(create_table_sql)
+            print(f"   ✅ Created table: {self.test_table}")
+            
+            # Use COPY INTO to load data from stage
+            copy_command = f"""
+            COPY INTO {self.test_table}
+            FROM @{self.test_stage}
+            FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = ',' SKIP_HEADER = 1)
+            """
+            
+            self.cursor.execute(copy_command)
+            copy_result = self.cursor.fetchall()
+            
+            print(f"   📥 COPY INTO result: {copy_result}")
+            
+            # Verify data was loaded
+            self.cursor.execute(f"SELECT COUNT(*) FROM {self.test_table}")
+            row_count = self.cursor.fetchone()[0]
+            
+            print(f"   📊 Rows loaded: {row_count}")
+            
+            if row_count > 0:
+                # Show sample data
+                self.cursor.execute(f"SELECT * FROM {self.test_table} LIMIT 3")
+                sample_data = self.cursor.fetchall()
+                print(f"   📋 Sample data: {sample_data}")
+                print("✅ Test 4 PASSED: COPY INTO working")
+                return True
+            else:
+                print("   ❌ No data was loaded")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Test 4 FAILED: {e}")
+            return False
+    
+    def test_5_pandas_integration(self):
+        """Test 5: Pandas integration with write_pandas"""
+        print("\n🧪 Test 5: Testing Pandas Integration")
+        
+        try:
+            # Create test DataFrame with different data types
+            test_data = {
+                'test_id': [101, 102, 103],
+                'test_name': ['Pandas Test 1', 'Pandas Test 2', 'Pandas Test 3'],
+                'test_timestamp': [datetime.now()] * 3,
+                'test_float': [3.14, 2.71, 1.41],
+                'test_boolean': [True, False, True]
+            }
+            
+            df = pd.DataFrame(test_data)
+            print(f"   📊 Created DataFrame with {len(df)} rows")
+            
+            # Use write_pandas to write data
+            pandas_table = f"{self.test_table}_PANDAS"
+            
+            success, nchunks, nrows, _ = write_pandas(
+                conn=self.conn,
+                df=df,
+                table_name=pandas_table,
+                auto_create_table=True,
+                overwrite=True
+            )
+            
+            print(f"   📤 write_pandas result: Success={success}, Chunks={nchunks}, Rows={nrows}")
+            
+            if success:
+                # Verify data
+                self.cursor.execute(f"SELECT COUNT(*) FROM {pandas_table}")
+                row_count = self.cursor.fetchone()[0]
+                print(f"   📊 Rows written via pandas: {row_count}")
+                
+                # Show sample
+                self.cursor.execute(f"SELECT * FROM {pandas_table} LIMIT 2")
+                sample = self.cursor.fetchall()
+                print(f"   📋 Sample pandas data: {sample}")
+                
+                print("✅ Test 5 PASSED: Pandas integration working")
+                return True
+            else:
+                print("   ❌ write_pandas failed")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Test 5 FAILED: {e}")
+            return False
+    
+    def test_6_oracle_wkt_preconversion(self):
+        """Test 6: Simulate Oracle data already converted to WKT format"""
+        print("\n🧪 Test 6: Testing Oracle Pre-Converted WKT Data")
+        
+        try:
+            # Simulate Oracle query result with SDO_UTIL.TO_WKTGEOMETRY() already applied
+            # This mimics: SELECT id, name, SDO_UTIL.TO_WKTGEOMETRY(shape) AS shape_wkt FROM oracle_table
+            oracle_wkt_data = {
+                'feature_id': [1001, 1002, 1003, 1004, 1005],
+                'feature_name': ['Building A', 'Highway 101', 'Central Park', 'Lake Tahoe', 'Point Reyes'],
+                'feature_type': ['BUILDING', 'ROAD', 'PARK', 'WATER', 'LANDMARK'],
+                'shape_wkt': [
+                    'POINT(-122.4194 37.7749)',
+                    'LINESTRING(-122.4194 37.7749, -122.4094 37.7849, -122.3994 37.7949)',
+                    'POLYGON((-122.4194 37.7749, -122.4094 37.7749, -122.4094 37.7849, -122.4194 37.7849, -122.4194 37.7749))',
+                    'POLYGON((-120.0 39.0, -119.8 39.0, -119.8 39.2, -120.0 39.2, -120.0 39.0))',
+                    'POINT(-122.8 38.1)'
+                ],
+                'area_sqft': [2500, None, 50000, 1500000, None],
+                'created_date': ['2024-01-15', '2024-02-01', '2024-01-30', '2024-03-10', '2024-02-20']
+            }
+            
+            df = pd.DataFrame(oracle_wkt_data)
+            print(f"   🗺️ Simulated Oracle extraction with {len(df)} spatial features")
+            print(f"   📊 Columns: {list(df.columns)}")
+            
+            # Test 1: Load WKT data into Snowflake (simulating our migration)
+            wkt_table = f"{self.test_table}_ORACLE_WKT"
+            
+            success, nchunks, nrows, _ = write_pandas(
+                conn=self.conn,
+                df=df,
+                table_name=wkt_table,
+                auto_create_table=True,
+                overwrite=True
+            )
+            
+            if not success:
+                print("   ❌ Failed to load Oracle WKT data")
+                return False
+                
+            print(f"   ✅ Loaded {nrows} Oracle spatial records into Snowflake")
+            
+            # Test 2: Query WKT data (using correct column names)
+            print("   🔍 Testing WKT data queries...")
+            
+            # Count by geometry type
+            self.cursor.execute(f'''
+                SELECT "feature_type", COUNT(*) as feature_count
+                FROM {wkt_table}
+                GROUP BY "feature_type"
+                ORDER BY feature_count DESC
+            ''')
+            
+            type_counts = self.cursor.fetchall()
+            print("   📊 Spatial features by type:")
+            for feature_type, count in type_counts:
+                print(f"      - {feature_type}: {count}")
+            
+            # Test 3: WKT string operations
+            self.cursor.execute(f'''
+                SELECT 
+                    "feature_name",
+                    "feature_type", 
+                    LEFT("shape_wkt", 15) || '...' as wkt_preview,
+                    LENGTH("shape_wkt") as wkt_length
+                FROM {wkt_table}
+                WHERE "area_sqft" IS NOT NULL
+                ORDER BY "area_sqft" DESC
+                LIMIT 3
+            ''')
+            
+            wkt_samples = self.cursor.fetchall()
+            print("   🏗️ Largest features with WKT preview:")
+            for name, ftype, preview, length in wkt_samples:
+                print(f"      - {name} ({ftype}): {preview} (Length: {length})")
+            
+            # Test 4: Simulate spatial analysis on WKT (basic string operations)
+            self.cursor.execute(f'''
+                SELECT 
+                    COUNT(*) as total_features,
+                    COUNT(CASE WHEN "shape_wkt" LIKE 'POINT%' THEN 1 END) as points,
+                    COUNT(CASE WHEN "shape_wkt" LIKE 'LINESTRING%' THEN 1 END) as lines,
+                    COUNT(CASE WHEN "shape_wkt" LIKE 'POLYGON%' THEN 1 END) as polygons
+                FROM {wkt_table}
+            ''')
+            
+            spatial_summary = self.cursor.fetchone()
+            total, points, lines, polygons = spatial_summary
+            print(f"   🎯 Spatial data summary:")
+            print(f"      - Total features: {total}")
+            print(f"      - Points: {points}")
+            print(f"      - Lines: {lines}")  
+            print(f"      - Polygons: {polygons}")
+            
+            # Test 5: Verify data integrity
+            self.cursor.execute(f'SELECT COUNT(*) FROM {wkt_table} WHERE "shape_wkt" IS NOT NULL')
+            valid_wkt_count = self.cursor.fetchone()[0]
+            
+            if valid_wkt_count == len(df):
+                print(f"   ✅ All {valid_wkt_count} WKT geometries loaded successfully")
+                print("✅ Test 6 PASSED: Oracle WKT pre-conversion simulation successful!")
+                return True
+            else:
+                print(f"   ❌ WKT data integrity issue: {valid_wkt_count}/{len(df)} records")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Test 6 FAILED: {e}")
+            return False
+    
+    def cleanup(self):
+        """Clean up test objects"""
+        print("\n🧹 Cleaning up test objects...")
+        
+        try:
+            # Drop test tables
+            self.cursor.execute(f"DROP TABLE IF EXISTS {self.test_table}")
+            self.cursor.execute(f"DROP TABLE IF EXISTS {self.test_table}_PANDAS")
+            self.cursor.execute(f"DROP TABLE IF EXISTS {self.test_table}_ORACLE_WKT")
+            
+            # Drop test stage
+            self.cursor.execute(f"DROP STAGE IF EXISTS {self.test_stage}")
+            
+            print("✅ Cleanup completed")
+            
+        except Exception as e:
+            print(f"⚠️ Cleanup warning: {e}")
+    
+    def run_all_tests(self):
+        """Run all tests"""
+        print("🚀 Starting Comprehensive Snowflake Python Connector Tests\n")
+        
+        tests = [
+            self.test_1_basic_queries,
+            self.test_2_create_stage,
+            self.test_3_put_command,
+            self.test_4_copy_into,
+            self.test_5_pandas_integration,
+            self.test_6_oracle_wkt_preconversion
+        ]
+        
+        results = []
+        
+        try:
+            if not self.connect():
+                print("❌ Failed to connect. Aborting tests.")
+                return False
+            
+            for i, test in enumerate(tests, 1):
+                result = test()
+                results.append(result)
+                
+                if not result:
+                    print(f"\n⚠️ Test {i} failed. Continuing with remaining tests...")
+            
+            # Summary
+            passed = sum(results)
+            total = len(results)
+            
+            print(f"\n📊 TEST SUMMARY")
+            print(f"{'='*50}")
+            print(f"Total Tests: {total}")
+            print(f"Passed: {passed}")
+            print(f"Failed: {total - passed}")
+            print(f"Success Rate: {(passed/total)*100:.1f}%")
+            
+            if passed == total:
+                print("\n🎉 ALL TESTS PASSED! Your Snowflake Python Connector is fully functional!")
+                print("✅ Ready for Oracle to Snowflake migration with WKT support!")
+            else:
+                print(f"\n⚠️ {total - passed} test(s) failed. Please review the errors above.")
+                
+        except Exception as e:
+            print(f"❌ Test execution failed: {e}")
+            
+        finally:
+            self.cleanup()
+            if self.cursor:
+                self.cursor.close()
+            if self.conn:
+                self.conn.close()
+        
+        return passed == total
+
+if __name__ == "__main__":
+    tester = SnowflakeFeatureTester()
+    tester.run_all_tests()
